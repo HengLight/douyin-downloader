@@ -1,0 +1,31 @@
+# 任务列表（与 config.yml 分离）。
+# 用法：
+#   python run.py -c config.yml --task config/task.yml
+# 不传 --task 时仍只读 config.yml 的 link，行为与原来一致。
+#
+# Cookie / 全局默认仍来自 config.yml；此处每条记录提供 link，
+# 并可按需覆盖 mode / number / path 等字段（仅作用于该条任务）。
+
+tasks:
+  # 用户主页模式（post/like/mix/music…）
+  - name: author_posts
+    link: https://www.douyin.com/user/MS4wLjABAAAA6O7EZyfDRYXxJrUTpf91K3tmB4rBROkAw-nYMfld8ss
+    mode:
+      - post
+    number:
+      post: 10
+
+  # 直接下载单个作品：mode: video + link 列表
+  - name: single_videos
+    mode: video
+    link:
+      - https://www.douyin.com/video/7123456789012345678
+      - https://www.douyin.com/note/7320876060210373923
+
+  # 简写：video 后面直接接 URL（或 URL 列表）
+  - video: https://www.douyin.com/video/7123456789012345678
+
+  - name: more_clips
+    video:
+      - https://www.douyin.com/video/7123456789012345678
+      - https://www.douyin.com/gallery/7320876060210373923

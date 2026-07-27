@@ -9,7 +9,7 @@ from typing import Any
 from auth import CookieManager
 from cli.login_flow import can_interactive_login, interactive_relogin
 from cli.progress_display import ProgressDisplay
-from config import ConfigLoader
+from config import ConfigLoader, iter_task_jobs
 from control import QueueManager, RateLimiter, RetryHandler
 from core import DouyinAPIClient, DownloaderFactory, LoginRequiredError, URLParser
 from storage import Database, FileManager
@@ -29,6 +29,44 @@ def _as_bool(value: Any, default: bool = True) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _normalize_cli_url_list(value) -> list:
+    if not value:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    urls = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            urls.append(item.strip())
+    return urls
+
+
+def _collect_cli_urls(args) -> list:
+    """Collect URLs from -u/--url, --video, and positional VIDEO_URL args."""
+    collected = []
+    for group in (
+        getattr(args, "url", None),
+        getattr(args, "video", None),
+        getattr(args, "video_urls", None),
+    ):
+        for url in _normalize_cli_url_list(group):
+            if url not in collected:
+                collected.append(url)
+    return collected
+
+
+def _append_links_to_config(config: ConfigLoader, urls: list) -> None:
+    links = list(config.get("link") or [])
+    changed = False
+    for url in urls:
+        if url not in links:
+            links.append(url)
+            changed = True
+    if changed:
+        config.update(link=links)
 
 
 async def _run_with_relogin(make_coro, cookie_manager, *, serve=False):
@@ -221,18 +259,48 @@ async def main_async(args):
         await _run_serve_subcommand(args, config)
         return
 
-    if args.url:
-        urls = args.url if isinstance(args.url, list) else [args.url]
-        for url in urls:
-            if url not in config.get("link", []):
-                config.update(link=config.get("link", []) + [url])
+    cli_urls = _collect_cli_urls(args)
+    if cli_urls:
+        _append_links_to_config(config, cli_urls)
 
     if args.thread:
         config.update(thread=args.thread)
 
-    if not config.validate():
-        display.print_error("Invalid configuration: missing required fields")
-        return
+    use_task_file = bool(getattr(args, "task", None)) and not cli_urls
+    if getattr(args, "task", None) and cli_urls:
+        display.print_info(
+            "检测到命令行作品 URL（--video / -u / VIDEO_URL），已跳过 --task 文件"
+        )
+
+    if use_task_file:
+        # Cookie / path 等仍来自 config.yml；link 改由 task.yml 提供。
+        if not config.validate(require_links=False):
+            display.print_error("Invalid configuration: missing required fields")
+            return
+        try:
+            task_jobs = iter_task_jobs(config, args.task)
+        except (OSError, ValueError) as exc:
+            display.print_error(f"Failed to load task file: {exc}")
+            return
+        if not task_jobs:
+            display.print_error(f"No valid task records in: {args.task}")
+            return
+    else:
+        # Allow config.yml without link when URLs come from CLI (--video / -u / positional).
+        if not config.validate(require_links=not bool(cli_urls)):
+            display.print_error("Invalid configuration: missing required fields")
+            return
+        if cli_urls:
+            # 命令行显式传入作品 URL 时，只下这些，不跑 config.yml 里原有 link。
+            task_jobs = [("cli-video", config, list(cli_urls))]
+        else:
+            if not config.get_links():
+                display.print_error(
+                    "No download URL. Use config.yml link, --task, --video, -u, "
+                    "or positional VIDEO_URL."
+                )
+                return
+            task_jobs = [("default", config, config.get_links())]
 
     cookies = config.get_cookies()
     cookie_manager = CookieManager()
@@ -248,8 +316,11 @@ async def main_async(args):
         await database.initialize()
         display.print_success("Database initialized")
 
-    urls = config.get_links()
-    display.print_info(f"Found {len(urls)} URL(s) to process")
+    total_urls = sum(len(urls) for _name, _cfg, urls in task_jobs)
+    display.print_info(
+        f"Found {total_urls} URL(s) to process"
+        + (f" across {len(task_jobs)} task(s)" if use_task_file else "")
+    )
 
     all_results = []
     progress_config = config.get("progress", {}) or {}
@@ -260,27 +331,32 @@ async def main_async(args):
         # 默认静默控制台日志，下载完成后再恢复。
         set_console_log_level(logging.CRITICAL)
 
-    display.start_download_session(len(urls))
+    display.start_download_session(total_urls)
+    url_index = 0
     try:
-        for i, url in enumerate(urls, 1):
-            display.start_url(i, len(urls), url)
+        for task_name, task_config, urls in task_jobs:
+            if use_task_file:
+                display.print_info(f"Task [{task_name}] — {len(urls)} URL(s)")
+            for url in urls:
+                url_index += 1
+                display.start_url(url_index, total_urls, url)
 
-            result = await _run_with_relogin(
-                lambda u=url: download_url(
-                    u,
-                    config,
+                result = await _run_with_relogin(
+                    lambda u=url, cfg=task_config: download_url(
+                        u,
+                        cfg,
+                        cookie_manager,
+                        database,
+                        progress_reporter=display,
+                    ),
                     cookie_manager,
-                    database,
-                    progress_reporter=display,
-                ),
-                cookie_manager,
-                serve=False,
-            )
-            if result:
-                all_results.append(result)
-                display.complete_url(result)
-            else:
-                display.fail_url("下载失败或链接无效")
+                    serve=False,
+                )
+                if result:
+                    all_results.append(result)
+                    display.complete_url(result)
+                else:
+                    display.fail_url("下载失败或链接无效")
     finally:
         display.stop_download_session()
         if database is not None:
@@ -384,7 +460,28 @@ async def _dispatch_notifications(config: ConfigLoader, total_result: Any, url_c
 def main():
     parser = argparse.ArgumentParser(description="Douyin Downloader - 抖音批量下载工具")
     parser.add_argument("-u", "--url", action="append", help="Download URL(s)")
+    parser.add_argument(
+        "--video",
+        action="append",
+        metavar="URL",
+        help="直接下载单个视频/图文 URL，可重复传入；例如 --video https://www.douyin.com/video/xxx",
+    )
+    parser.add_argument(
+        "video_urls",
+        nargs="*",
+        metavar="VIDEO_URL",
+        help="位置参数：直接跟单个或多个作品 URL，例如 python run.py https://www.douyin.com/video/xxx",
+    )
     parser.add_argument("-c", "--config", help="Config file path (default: config.yml)")
+    parser.add_argument(
+        "--task",
+        help=(
+            "Optional task.yml path. When set (and no CLI video URL is given), "
+            "process each record in the file; cookies/defaults still come from "
+            "-c/--config. If --video / -u / VIDEO_URL is present, task.yml is skipped. "
+            "When omitted, keep reading link from config.yml as before."
+        ),
+    )
     parser.add_argument("-p", "--path", help="Save path")
     parser.add_argument("-t", "--thread", type=int, help="Thread count")
     parser.add_argument("--show-warnings", action="store_true", help="Show warning logs in console")

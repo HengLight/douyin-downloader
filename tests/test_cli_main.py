@@ -104,6 +104,44 @@ async def test_download_url_passes_proxy_to_api_client(monkeypatch, tmp_path):
     assert captured["proxy"] == "http://127.0.0.1:8899"
 
 
+def test_cli_urls_skip_task_file_flag():
+    """Command-line video URLs should win over --task (task file not loaded)."""
+    args = SimpleNamespace(
+        url=None,
+        video=["https://www.douyin.com/video/1"],
+        video_urls=[],
+        task="config/task.yml",
+    )
+    cli_urls = main_module._collect_cli_urls(args)
+    use_task_file = bool(getattr(args, "task", None)) and not cli_urls
+    assert cli_urls == ["https://www.douyin.com/video/1"]
+    assert use_task_file is False
+
+
+def test_task_file_used_when_no_cli_urls():
+    args = SimpleNamespace(url=None, video=None, video_urls=[], task="config/task.yml")
+    cli_urls = main_module._collect_cli_urls(args)
+    use_task_file = bool(getattr(args, "task", None)) and not cli_urls
+    assert cli_urls == []
+    assert use_task_file is True
+
+
+def test_append_links_to_config_dedupes(tmp_path):
+    config = main_module.ConfigLoader()
+    config.update(path=str(tmp_path), link=["https://www.douyin.com/video/1"])
+    main_module._append_links_to_config(
+        config,
+        [
+            "https://www.douyin.com/video/1",
+            "https://www.douyin.com/video/2",
+        ],
+    )
+    assert config.get_links() == [
+        "https://www.douyin.com/video/1",
+        "https://www.douyin.com/video/2",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_discovery_subcommand_passes_proxy_to_api_client(monkeypatch, tmp_path):
     """--hot-board / --search 与下载共用 DouyinAPIClient,同样必须透传代理。

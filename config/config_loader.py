@@ -334,8 +334,8 @@ class ConfigLoader:
             return [links]
         return links
 
-    def validate(self) -> bool:
-        if not self.get_links():
+    def validate(self, *, require_links: bool = True) -> bool:
+        if require_links and not self.get_links():
             return False
         if not self.config.get("path"):
             return False
