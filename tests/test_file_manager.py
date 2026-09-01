@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -53,6 +55,27 @@ def test_get_save_path_author_dir_nickname_default(tmp_path):
     )
     assert "测试作者" in str(path)
     assert "MS4wLjABAAAA_abc" not in str(path)
+
+
+def test_get_author_dir_matches_save_path_author_root(tmp_path):
+    fm = FileManager(str(tmp_path))
+    author_dir = fm.get_author_dir(
+        "测试作者",
+        author_sec_uid="sec_uid_x",
+        author_dir_style="nickname_uid",
+    )
+    save_path = fm.get_save_path(
+        "测试作者",
+        mode="post",
+        aweme_title="T",
+        aweme_id="1",
+        author_sec_uid="sec_uid_x",
+        author_dir_style="nickname_uid",
+    )
+
+    assert author_dir == tmp_path / "测试作者_sec_uid_x"
+    assert author_dir.exists()
+    assert author_dir in save_path.parents
 
 
 def test_get_save_path_author_dir_sec_uid(tmp_path):
@@ -392,6 +415,26 @@ class _FakeHttpxClient:
         return self._response
 
 
+class _CloseTrackingHttpxClient(_FakeHttpxClient):
+    def __init__(self, response, closed):
+        super().__init__(response, [])
+        self._closed = closed
+
+    async def aclose(self):
+        self._closed.set()
+
+
+_THREAD_EVENT_TIMEOUT_S = 5.0
+
+
+async def _wait_for_thread_event(event, timeout=_THREAD_EVENT_TIMEOUT_S):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not event.is_set():
+        if asyncio.get_running_loop().time() >= deadline:
+            pytest.fail("worker thread event was not set before timeout")
+        await asyncio.sleep(0.001)
+
+
 @pytest.mark.asyncio
 async def test_download_file_falls_back_to_httpx_on_403(tmp_path, monkeypatch):
     """Douyin's image CDN 403s aiohttp's TLS fingerprint for some assets
@@ -424,6 +467,81 @@ async def test_download_file_falls_back_to_httpx_on_403(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_httpx_fallback_keeps_event_loop_responsive_during_client_setup(
+    tmp_path, monkeypatch
+):
+    """Slow synchronous HTTPX setup must not starve sidecar health requests."""
+    fm = FileManager(str(tmp_path))
+    response = _FakeHttpxResponse(
+        200,
+        b"cover",
+        {"Content-Type": "image/jpeg", "Content-Length": "5"},
+    )
+    setup_started = threading.Event()
+    release_setup = threading.Event()
+    released_while_setting_up = []
+
+    def _slow_client(*args, **kwargs):
+        setup_started.set()
+        released_while_setting_up.append(release_setup.wait(timeout=_THREAD_EVENT_TIMEOUT_S))
+        return _FakeHttpxClient(response, [])
+
+    async def _heartbeat():
+        while not setup_started.is_set():
+            await asyncio.sleep(0)
+        release_setup.set()
+
+    monkeypatch.setattr("storage.file_manager.httpx.AsyncClient", _slow_client)
+    heartbeat = asyncio.create_task(_heartbeat())
+
+    result = await fm.download_file(
+        "https://p3-pc-sign.douyinpic.com/cover.jpg",
+        tmp_path / "cover.jpg",
+        session=_aiohttp_session_returning_status(403),
+    )
+    await heartbeat
+
+    assert result is True
+    assert released_while_setting_up == [True]
+
+
+@pytest.mark.asyncio
+async def test_httpx_fallback_closes_client_when_cancelled_during_setup(tmp_path, monkeypatch):
+    """Cancellation must not orphan a client that the worker finishes constructing."""
+    fm = FileManager(str(tmp_path))
+    response = _FakeHttpxResponse(200, b"cover", {"Content-Type": "image/jpeg"})
+    setup_started = threading.Event()
+    release_setup = threading.Event()
+    setup_finished = threading.Event()
+    client_closed = threading.Event()
+
+    def _blocking_client(*args, **kwargs):
+        setup_started.set()
+        release_setup.wait(timeout=_THREAD_EVENT_TIMEOUT_S)
+        client = _CloseTrackingHttpxClient(response, client_closed)
+        setup_finished.set()
+        return client
+
+    monkeypatch.setattr("storage.file_manager.httpx.AsyncClient", _blocking_client)
+    task = asyncio.create_task(
+        fm.download_file(
+            "https://p3-pc-sign.douyinpic.com/cover.jpg",
+            tmp_path / "cover.jpg",
+            session=_aiohttp_session_returning_status(403),
+        )
+    )
+
+    await _wait_for_thread_event(setup_started)
+    task.cancel()
+    release_setup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await _wait_for_thread_event(setup_finished)
+
+    assert client_closed.is_set()
+
+
+@pytest.mark.asyncio
 async def test_download_file_no_httpx_fallback_on_404(tmp_path, monkeypatch):
     """A genuine 404 (dead/expired asset) must NOT trigger the httpx fallback —
     falling back on every non-200 would double every doomed request."""
@@ -447,6 +565,47 @@ async def test_download_file_no_httpx_fallback_on_404(tmp_path, monkeypatch):
     assert result is False
     assert not save_path.exists()
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_download_file_sets_granular_timeouts(tmp_path):
+    """/aweme/v1/play/ 302 后可能落到打不通的 PCDN 节点（高位端口 SYN 黑洞），
+    没有 connect 细分超时时握手会把 total=300s 全部耗光（线上日志实测两次
+    重试间隔正好 300s），批量任务队尾因此长时间停滞。"""
+    fm = FileManager(str(tmp_path))
+    session = _aiohttp_session_returning_status(404)
+
+    await fm.download_file("https://example.com/v.mp4", tmp_path / "v.mp4", session=session)
+
+    timeout = session.get.call_args.kwargs["timeout"]
+    assert timeout.total == 300
+    assert timeout.connect == 15
+    assert timeout.sock_read == 60
+
+
+@pytest.mark.asyncio
+async def test_httpx_fallback_sets_granular_timeouts(tmp_path, monkeypatch):
+    """httpx 403 兜底路径与 aiohttp 主路径保持同样的连接/读间隙上限。"""
+    fm = FileManager(str(tmp_path))
+    captured = {}
+    calls = []
+    response = _FakeHttpxResponse(200, b"x", {"Content-Type": "image/jpeg", "Content-Length": "1"})
+
+    def _fake_client(*args, **kwargs):
+        captured.update(kwargs)
+        return _FakeHttpxClient(response, calls)
+
+    monkeypatch.setattr("storage.file_manager.httpx.AsyncClient", _fake_client)
+
+    await fm.download_file(
+        "https://p3-pc-sign.douyinpic.com/x.jpg",
+        tmp_path / "x.jpg",
+        session=_aiohttp_session_returning_status(403),
+    )
+
+    timeout = captured["timeout"]
+    assert timeout.connect == 15
+    assert timeout.read == 60
 
 
 @pytest.mark.asyncio

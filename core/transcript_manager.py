@@ -103,7 +103,7 @@ class TranscriptManager:
         """``transcript.upload_audio_only`` flag (R1.14, default ``True``).
 
         Hidden from the Settings UI by design (R1.18); editable only via
-        ``settings.yml`` or a direct ``PATCH /api/v1/settings`` call so a
+        ``settings.yml`` or a direct ``POST /api/v1/settings`` call so a
         user wandering through the UI can't accidentally disable the
         bandwidth-saving path.
         """
@@ -351,7 +351,10 @@ class TranscriptManager:
                 filename=filename,
                 content_type=content_type,
             )
-            timeout = aiohttp.ClientTimeout(total=600)
+            # connect 必须单独设限：自定义 base_url/死代理指向黑洞端点时，
+            # 纯 total 会让每个视频在 worker 槽里挂满 10 分钟。总超时保留
+            # 600s 且不设读间隙限制——转写服务端合法处理可达分钟级。
+            timeout = aiohttp.ClientTimeout(total=600, connect=15)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     api_url,

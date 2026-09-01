@@ -3,7 +3,10 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
+import aiofiles
+
 from core.downloader_base import BaseDownloader, DownloadResult
+from core.metadata import build_author_home_url
 from core.user_mode_registry import UserModeRegistry
 from utils.logger import setup_logger
 
@@ -45,6 +48,8 @@ class UserDownloader(BaseDownloader):
         if not self._validate_mode_scope(sec_uid, modes):
             return result
 
+        sec_uid = await self._resolve_self_alias(sec_uid, modes)
+
         logger.info(
             "User download started: sec_uid=%s modes=%s number=%s increase=%s",
             sec_uid,
@@ -57,6 +62,8 @@ class UserDownloader(BaseDownloader):
             nickname=user_info.get("nickname"),
             sec_uid=user_info.get("sec_uid") or sec_uid,
         )
+        await self._save_author_home_url(sec_uid, user_info, modes)
+        await self._save_homepage_screenshot(sec_uid, user_info, modes)
         self._progress_update_step("下载模式", f"模式: {', '.join(modes)}")
 
         seen_aweme_ids: Set[str] = set()
@@ -74,6 +81,109 @@ class UserDownloader(BaseDownloader):
             result.skipped,
         )
         return result
+
+    async def _resolve_self_alias(self, sec_uid: str, modes: List[str]) -> str:
+        """把 ``/user/self`` 里的 ``self`` 换成登录账号真实 sec_uid。
+
+        抖音网页版自己主页的地址栏形态是 ``/user/self``，``self`` 是"当前
+        登录者"的别名而不是 sec_uid：直接透传给
+        ``/aweme/v1/web/user/profile/other/?sec_user_id=self`` 会拿到
+        ``status_code=2 UserId不合法``、``user={}``，旧代码把这个空结果当成
+        "用户信息拿不到"，抛出误导性的 Cookie 失效错误。
+
+        收藏夹模式（collect/collectmix）按 cookie 身份分页，不需要真实
+        sec_uid，保持 ``self`` 原样走既有分支。
+        """
+        if sec_uid != "self":
+            return sec_uid
+
+        normalized_modes = {str(mode or "").strip() for mode in modes}
+        if normalized_modes.issubset(self.SELF_COLLECT_MODES):
+            return sec_uid
+
+        self._progress_update_step("识别账号", "解析当前登录账号主页")
+        try:
+            self_info = await self.api_client.get_self_info()
+        except Exception as exc:  # noqa: BLE001 - 任何失败都归为"解析不出账号"
+            logger.warning("Resolve /user/self failed: %s", exc)
+            self_info = None
+
+        resolved = str((self_info or {}).get("sec_uid") or "").strip()
+        if not resolved:
+            raise RuntimeError(
+                "无法识别当前登录账号，请重新登录抖音，"
+                "或改用自己主页的完整链接（形如 https://www.douyin.com/user/MS4w...）"
+            )
+        logger.info("Resolved /user/self alias: sec_uid=%s", resolved)
+        return resolved
+
+    async def _save_author_home_url(
+        self,
+        sec_uid: str,
+        user_info: Dict[str, Any],
+        modes: List[str],
+    ) -> None:
+        if not self._as_bool(self.config.get("author_url", False)):
+            return
+
+        normalized_modes = {str(mode or "").strip() for mode in modes}
+        if sec_uid == "self" or normalized_modes.issubset(self.SELF_COLLECT_MODES):
+            return
+
+        effective_sec_uid = str(user_info.get("sec_uid") or sec_uid).strip()
+        author_url = build_author_home_url(effective_sec_uid)
+        if not author_url or effective_sec_uid == "self":
+            logger.warning("Author homepage URL skipped because sec_uid is unavailable")
+            return
+
+        author_name = str(user_info.get("nickname") or "unknown")
+        try:
+            author_dir = self.file_manager.get_author_dir(
+                author_name,
+                author_sec_uid=effective_sec_uid,
+                author_dir_style=self.config.get("author_dir") or "nickname",
+            )
+            async with aiofiles.open(
+                (author_dir / "author_url.txt").resolve(), "w", encoding="utf-8"
+            ) as output:
+                await output.write(f"{author_url}\n")
+        except Exception as exc:
+            logger.warning("Author homepage URL failed for %s: %s", effective_sec_uid, exc)
+
+    async def _save_homepage_screenshot(
+        self,
+        sec_uid: str,
+        user_info: Dict[str, Any],
+        modes: List[str],
+    ) -> None:
+        if not self._as_bool(self.config.get("homepage_screenshot", False)):
+            return
+
+        normalized_modes = {str(mode or "").strip() for mode in modes}
+        if sec_uid == "self" or normalized_modes.issubset(self.SELF_COLLECT_MODES):
+            return
+
+        effective_sec_uid = str(user_info.get("sec_uid") or sec_uid).strip()
+        if not effective_sec_uid or effective_sec_uid == "self":
+            logger.warning("Homepage screenshot skipped because sec_uid is unavailable")
+            return
+
+        author_name = str(user_info.get("nickname") or "unknown")
+        try:
+            author_dir = self.file_manager.get_author_dir(
+                author_name,
+                author_sec_uid=effective_sec_uid,
+                author_dir_style=self.config.get("author_dir") or "nickname",
+            )
+            saved = await self.api_client.save_user_homepage_screenshot(
+                effective_sec_uid,
+                (author_dir / "主页截图.png").resolve(),
+                profile=user_info,
+            )
+            if not saved:
+                logger.warning("Homepage screenshot was not saved for %s", effective_sec_uid)
+        except Exception as exc:
+            logger.warning("Homepage screenshot failed for %s: %s", effective_sec_uid, exc)
 
     def _configured_modes(self) -> List[str]:
         modes_config = self.config.get("mode", ["post"])
@@ -291,10 +401,19 @@ class UserDownloader(BaseDownloader):
         # Accumulate per-aweme DB records and flush in a single transaction
         # at the end — avoids one fsync per item across the whole batch.
         db_batch: Optional[List[Dict[str, Any]]] = [] if self.database else None
+        increase_config = self.config.get("increase", {})
+        force_download = (
+            isinstance(increase_config, dict)
+            and mode in increase_config
+            and not bool(increase_config.get(mode))
+        )
 
         async def _process_aweme(item: Dict[str, Any]):
             aweme_id = item.get("aweme_id")
-            if not await self._should_download(str(aweme_id or "")):
+            if not await self._should_download(
+                str(aweme_id or ""),
+                force=force_download,
+            ):
                 saved = await self._collect_comments_for_existing_aweme(
                     item,
                     author_name,

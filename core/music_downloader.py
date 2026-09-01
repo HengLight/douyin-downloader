@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from core.downloader_base import BaseDownloader, DownloadResult
-from core.metadata import extract_author_sec_uid
+from core.metadata import build_author_home_url, extract_author_sec_uid
 from utils.logger import setup_logger
 from utils.naming import (
     DEFAULT_FILE_TEMPLATE,
@@ -113,6 +113,9 @@ class MusicDownloader(BaseDownloader):
             fallback=f"{publish_date}_{record_id}",
         )
 
+        # 让「打开输出文件夹」落到该作者目录而不是下载根目录。
+        author_dir_style = self.config.get("author_dir") or "nickname"
+        self._report_author_output_dir(author_name, None, author_dir_style)
         save_dir = self.file_manager.get_save_path(
             author_name=author_name,
             mode="music",
@@ -122,7 +125,7 @@ class MusicDownloader(BaseDownloader):
             download_date=publish_date,
             folder_name=folder_name,
             author_sec_uid=None,
-            author_dir_style=self.config.get("author_dir") or "nickname",
+            author_dir_style=author_dir_style,
             group_by_mode=self.config.get("group_by_mode", True),
         )
 
@@ -161,6 +164,7 @@ class MusicDownloader(BaseDownloader):
                 detail or {"music_id": music_id}, save_dir / f"{file_stem}_data.json"
             )
 
+        author_sec_uid = extract_author_sec_uid(detail)
         if self.database:
             await self.database.add_aweme(
                 {
@@ -174,7 +178,7 @@ class MusicDownloader(BaseDownloader):
                     "metadata": json.dumps(detail or {}, ensure_ascii=False),
                     "job_id": self.job_id or "",
                 },
-                author_sec_uid=extract_author_sec_uid(detail),
+                author_sec_uid=author_sec_uid,
             )
 
         await self.metadata_handler.append_download_manifest(
@@ -183,6 +187,8 @@ class MusicDownloader(BaseDownloader):
                 "date": publish_date,
                 "aweme_id": record_id,
                 "author_name": author_name,
+                "author_sec_uid": author_sec_uid or "",
+                "author_url": build_author_home_url(author_sec_uid) or "",
                 "desc": title,
                 "media_type": "music",
                 "file_names": [music_path.name],

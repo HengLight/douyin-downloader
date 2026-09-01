@@ -2,10 +2,14 @@ from typing import Any, Dict
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "path": "./Downloaded/",
-    "music": True,
-    "cover": True,
-    "avatar": True,
-    "json": True,
+    # 处理内容开关：默认只保存视频本体。封面 / 音乐 / 头像 / 作品 JSON 都是
+    # 附带产物，绝大多数用户并不需要，默认全开会平白多出几倍文件和请求。
+    # 只影响新配置；已有 config.yml 里显式写过的值不受影响。
+    "video": True,
+    "music": False,
+    "cover": False,
+    "avatar": False,
+    "json": False,
     "start_time": "",
     "end_time": "",
     "folderstyle": True,
@@ -24,6 +28,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     #   False - 不分模式层，文件直接落在作者目录下（复刻 legacy 布局，无 POST 文件夹）
     "group_by_mode": True,
     "download_pinned": False,
+    # 下载博主作品时，是否在作者根目录覆盖保存主页地址文本。
+    "author_url": False,
+    # 下载博主作品时，是否在作者根目录覆盖保存一张主页首屏截图。
+    "homepage_screenshot": False,
     "mode": ["post"],
     "number": {
         "post": 0,
@@ -34,19 +42,26 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "collect": 0,
         "collectmix": 0,
     },
+    # 增量下载首先检查磁盘主文件。磁盘缺失时，True 会重新下载；False 会在数据库
+    # 存在有效下载记录（file_path 非空）时继续跳过。默认 True 保持历史行为。
+    "redownload_missing_files": True,
+    # 各模式是否启用增量下载；False 会强制重下并原子覆盖当前筛选范围。
     "increase": {
-        "post": False,
-        "like": False,
-        "allmix": False,
-        "mix": False,
-        "music": False,
+        "post": True,
+        "like": True,
+        "allmix": True,
+        "mix": True,
+        "music": True,
     },
     "thread": 5,
     "retry_times": 3,
     "rate_limit": 2,
     "proxy": "",
     # 视频下载画质。可选值：
-    #   "highest"  - 最高可用档（默认，与历史行为一致）
+    #   "original" - 原画：探测上传原片（ratio=default，转码档列表之外，可比
+    #                最高转码档大数倍），比最高转码档大则优先下载；探测失败
+    #                退回最高转码档。代价是每条作品多一次探测请求（超时 10s）
+    #   "highest"  - 最高转码档（默认）：只在 bit_rate 阶梯里挑，不发探测请求
     #   "lowest"   - 最低可用档（省流量）
     #   "1440p" / "1080p" / "720p" / "540p" / "480p" / "360p"
     #              - 指定分辨率，匹配不到时自动降级到最接近的可用档

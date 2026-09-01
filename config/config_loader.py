@@ -70,7 +70,7 @@ class ConfigLoader:
         # canonical key 为 mix，allmix 作为兼容别名保留并同步
         normalization_rules = (
             ("number", 0),
-            ("increase", False),
+            ("increase", True),
         )
         for section, default_value in normalization_rules:
             section_config = config.get(section)
@@ -160,11 +160,14 @@ class ConfigLoader:
         "path",
         "thread",
         "rate_limit",
+        "video",
         "cover",
         "music",
         "avatar",
         "json",
         "download_pinned",
+        "author_url",
+        "homepage_screenshot",
         "proxy",
         "retry_times",
         "folderstyle",

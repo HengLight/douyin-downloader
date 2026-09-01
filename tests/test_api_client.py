@@ -1,7 +1,10 @@
 import asyncio
+import base64
 import json
+import logging
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -35,6 +38,8 @@ def test_build_signed_path_accepts_absolute_base_override():
 
 
 def test_build_signed_path_prefers_abogus(monkeypatch):
+    captured = {}
+
     class _FakeFp:
         @staticmethod
         def generate_fingerprint(_browser):
@@ -46,6 +51,7 @@ def test_build_signed_path_prefers_abogus(monkeypatch):
             self.user_agent = user_agent
 
         def generate_abogus(self, params, body=""):
+            captured.update(params=params, body=body)
             return (f"{params}&a_bogus=fake_ab", "fake_ab", self.user_agent, body)
 
     import core.api_client as api_module
@@ -56,8 +62,134 @@ def test_build_signed_path_prefers_abogus(monkeypatch):
     client = DouyinAPIClient({"msToken": "token-1"})
     client._abogus_enabled = True
 
-    signed_url, _ua = client.build_signed_path("/aweme/v1/web/aweme/detail/", {"a": 1})
+    signed_url, _ua = client.build_signed_path(
+        "/aweme/v1/web/aweme/detail/", {"a": 1}, request_data={"cursor": 3, "count": 20}
+    )
     assert "a_bogus=fake_ab" in signed_url
+    assert captured["body"] == "cursor=3&count=20"
+
+
+def test_homepage_screenshot_bridge_emits_encoded_request(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("DOUYIN_HOMEPAGE_SCREENSHOT_BRIDGE", "electron")
+    client = DouyinAPIClient({"msToken": "token-1"})
+    target = (tmp_path / "作者" / "主页截图.png").resolve()
+
+    saved = asyncio.run(
+        client.save_user_homepage_screenshot(
+            "sec_uid_x",
+            target,
+            profile={
+                "nickname": "测试作者",
+                "follower_count": 0,
+                "following_count": 12,
+                "total_favorited": 345,
+                "signature": "must-not-cross-bridge",
+            },
+        )
+    )
+
+    assert saved is True
+    line = capsys.readouterr().out.strip()
+    prefix = "DOUYIN_HOMEPAGE_SCREENSHOT_REQUEST "
+    assert line.startswith(prefix)
+    encoded = line[len(prefix) :]
+    encoded += "=" * (-len(encoded) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    assert payload == {
+        "version": 1,
+        "sec_uid": "sec_uid_x",
+        "save_path": str(target),
+        "profile": {
+            "nickname": "测试作者",
+            "follower_count": 0,
+            "following_count": 12,
+            "total_favorited": 345,
+        },
+    }
+
+
+def test_homepage_screenshot_playwright_captures_viewport(tmp_path, monkeypatch):
+    captured = {}
+
+    class _FakePage:
+        async def goto(self, url, **kwargs):
+            captured["url"] = url
+            captured["goto"] = kwargs
+
+        async def title(self):
+            return "作者主页"
+
+        async def wait_for_function(self, expression, **kwargs):
+            captured["wait_for_function"] = {"expression": expression, **kwargs}
+
+        async def evaluate(self, expression):
+            captured["evaluate"] = expression
+            return ""
+
+        async def screenshot(self, **kwargs):
+            captured["screenshot"] = kwargs
+            Path(kwargs["path"]).write_bytes(b"png")
+
+    class _FakeContext:
+        async def add_cookies(self, cookies):
+            captured["cookies"] = cookies
+
+        async def new_page(self):
+            return _FakePage()
+
+        async def close(self):
+            captured["context_closed"] = True
+
+    class _FakeBrowser:
+        async def new_context(self, **kwargs):
+            captured["context"] = kwargs
+            return _FakeContext()
+
+        async def close(self):
+            captured["browser_closed"] = True
+
+    class _FakeChromium:
+        async def launch(self, **kwargs):
+            captured["launch"] = kwargs
+            return _FakeBrowser()
+
+    class _FakePlaywright:
+        chromium = _FakeChromium()
+
+    class _FakeManager:
+        async def __aenter__(self):
+            return _FakePlaywright()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: _FakeManager()
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+    monkeypatch.delenv("DOUYIN_HOMEPAGE_SCREENSHOT_BRIDGE", raising=False)
+
+    client = DouyinAPIClient({"msToken": "token-1", "sessionid_ss": "cookie"})
+    target = tmp_path / "主页截图.png"
+    saved = asyncio.run(client.save_user_homepage_screenshot("sec_uid_x", target))
+
+    assert saved is True
+    assert target.read_bytes() == b"png"
+    assert captured["context"]["viewport"] == {"width": 1600, "height": 900}
+    assert "粉丝" in captured["wait_for_function"]["expression"]
+    # 就绪判定必须覆盖整个视口的图片（含作品网格），只看资料区会在网格还是
+    # 灰块时就放行；与桌面版 inspectHomepageProfileContent 保持一致。
+    assert "document.images" in captured["wait_for_function"]["expression"]
+    assert captured["wait_for_function"]["timeout"] == 45_000
+    assert "count >= 3" in captured["wait_for_function"]["expression"]
+    assert captured["wait_for_function"]["arg"] == {}
+    assert captured["wait_for_function"]["polling"] == 250
+    assert "PROFILE_BLOCKED_REASON" in captured["evaluate"]
+    assert captured["screenshot"]["full_page"] is False
+    assert captured["screenshot"]["type"] == "png"
+    assert captured["context_closed"] is True
+    assert captured["browser_closed"] is True
 
 
 def test_browser_fallback_caps_warmup_wait(monkeypatch):
@@ -417,7 +549,7 @@ async def test_user_mode_endpoints_use_shared_paged_normalization(monkeypatch):
     client = DouyinAPIClient({"msToken": "token-1"})
     called_requests = []
 
-    async def _fake_request_json(path, params, suppress_error=False):
+    async def _fake_request_json(path, params, suppress_error=False, **_kwargs):
         called_requests.append((path, dict(params)))
         return {"status_code": 0, "aweme_list": [], "has_more": 0, "max_cursor": 0}
 
@@ -509,8 +641,15 @@ async def test_collect_endpoints_use_expected_paths_and_normalization(monkeypatc
     client = DouyinAPIClient({"msToken": "token-1"})
     called_requests = []
 
-    async def _fake_request_json(path, params, suppress_error=False):
-        called_requests.append((path, dict(params)))
+    async def _fake_request_json(path, params, suppress_error=False, **kwargs):
+        called_requests.append((path, dict(params), kwargs))
+        if path == "/aweme/v1/web/aweme/listcollection/":
+            return {
+                "status_code": 0,
+                "aweme_list": [{"aweme_id": "account-aweme-1"}],
+                "has_more": 1,
+                "cursor": 7,
+            }
         if path == "/aweme/v1/web/collects/list/":
             return {
                 "status_code": 0,
@@ -536,20 +675,35 @@ async def test_collect_endpoints_use_expected_paths_and_normalization(monkeypatc
 
     monkeypatch.setattr(client, "_request_json", _fake_request_json)
 
+    account_collection_data = await client.get_user_collection("self", max_cursor=3, count=20)
     collects_data = await client.get_user_collects("self", max_cursor=0, count=10)
     collect_aweme_data = await client.get_collect_aweme("collect-1", max_cursor=0, count=10)
     collect_mix_data = await client.get_user_collect_mix("self", max_cursor=0, count=12)
 
-    assert [path for path, _params in called_requests] == [
+    assert [path for path, _params, _kwargs in called_requests] == [
+        "/aweme/v1/web/aweme/listcollection/",
         "/aweme/v1/web/collects/list/",
         "/aweme/v1/web/collects/video/list/",
         "/aweme/v1/web/mix/listcollection/",
     ]
-    assert called_requests[0][1]["count"] == 10
-    assert called_requests[0][1]["version_code"] == "170400"
-    assert called_requests[1][1]["collects_id"] == "collect-1"
+    account_path, account_params, account_kwargs = called_requests[0]
+    assert account_path == "/aweme/v1/web/aweme/listcollection/"
+    assert account_params["publish_video_strategy_type"] == "2"
+    assert account_params["version_code"] == "170400"
+    assert account_kwargs["method"] == "POST"
+    assert account_kwargs["data"] == {"count": 20, "cursor": 3}
+    assert account_kwargs["request_headers"]["Content-Type"] == (
+        "application/x-www-form-urlencoded"
+    )
+    assert account_kwargs["request_headers"]["Referer"].endswith("showTab=favorite_collection")
     assert called_requests[1][1]["count"] == 10
-    assert called_requests[2][1]["count"] == 12
+    assert called_requests[1][1]["version_code"] == "170400"
+    assert called_requests[2][1]["collects_id"] == "collect-1"
+    assert called_requests[2][1]["count"] == 10
+    assert called_requests[3][1]["count"] == 12
+    assert account_collection_data["items"] == [{"aweme_id": "account-aweme-1"}]
+    assert account_collection_data["has_more"] is True
+    assert account_collection_data["max_cursor"] == 7
     assert collects_data["items"] == [{"collects_id_str": "collect-1"}]
     assert collects_data["has_more"] is True
     assert collects_data["max_cursor"] == 9
@@ -700,3 +854,150 @@ async def test_get_video_detail_returns_on_first_success():
     assert detail is not None
     assert detail["aweme_id"] == "456"
     assert call_count == 1  # no retry needed
+
+
+# ---------------------------------------------------------------------------
+# Page bridge routing (desktop injects a bridge; CLI never does)
+# ---------------------------------------------------------------------------
+
+
+class _BridgeResult:
+    def __init__(self, http_status, body, text=""):
+        self.http_status = http_status
+        self.body = body
+        self.text = text
+
+
+class _BridgeFailure(Exception):
+    def __init__(self, code):
+        super().__init__(f"page bridge {code}")
+        self.page_bridge_code = code
+
+
+class _FakeBridge:
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    async def fetch(self, path, params, *, method="GET", data=None):
+        self.calls.append({"path": path, "params": dict(params), "method": method, "data": data})
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+_GATED_CALLS = [
+    ("get_user_like", ("sec-1",), "/aweme/v1/web/aweme/favorite/", "GET"),
+    ("get_user_collection", ("self",), "/aweme/v1/web/aweme/listcollection/", "POST"),
+    ("get_user_collects", ("self",), "/aweme/v1/web/collects/list/", "GET"),
+    ("get_collect_aweme", ("folder-1",), "/aweme/v1/web/collects/video/list/", "GET"),
+    ("get_user_collect_mix", ("self",), "/aweme/v1/web/mix/listcollection/", "GET"),
+]
+
+
+@pytest.mark.parametrize("method_name,args,path,http_method", _GATED_CALLS)
+async def test_gated_methods_use_page_bridge_when_present(method_name, args, path, http_method):
+    bridge = _FakeBridge(_BridgeResult(200, {"status_code": 0, "aweme_list": [], "has_more": 0}))
+    client = DouyinAPIClient({"msToken": "t"}, page_bridge=bridge)
+
+    async def _must_not_run(*_a, **_k):
+        raise AssertionError("aiohttp path must not be used when a bridge is injected")
+
+    client._request_json = _must_not_run
+    await getattr(client, method_name)(*args)
+    assert len(bridge.calls) == 1
+    assert bridge.calls[0]["path"] == path
+    assert bridge.calls[0]["method"] == http_method
+    if http_method == "POST":
+        assert bridge.calls[0]["data"] == {"count": 20, "cursor": 0}
+    await client.close()
+
+
+async def test_gated_methods_fall_back_to_request_json_without_bridge():
+    client = DouyinAPIClient({"msToken": "t"})
+    seen = []
+
+    async def _fake_request_json(path, params, **kwargs):
+        seen.append((path, kwargs.get("method", "GET")))
+        return {"status_code": 0, "aweme_list": []}
+
+    client._request_json = _fake_request_json
+    await client.get_user_like("sec-1")
+    await client.get_user_collection("self")
+    assert seen == [
+        ("/aweme/v1/web/aweme/favorite/", "GET"),
+        ("/aweme/v1/web/aweme/listcollection/", "POST"),
+    ]
+    await client.close()
+
+
+async def test_non_gated_methods_never_touch_the_bridge():
+    bridge = _FakeBridge(_BridgeResult(200, {"status_code": 0}))
+    client = DouyinAPIClient({"msToken": "t"}, page_bridge=bridge)
+
+    async def _fake_request_json(path, params, **kwargs):
+        return {"status_code": 0, "aweme_list": [], "has_more": 0}
+
+    client._request_json = _fake_request_json
+    await client.get_user_post("sec-1")
+    await client.get_mix_aweme("mix-1")
+    assert bridge.calls == []
+    await client.close()
+
+
+async def test_bridge_login_required_body_raises_login_required_error():
+    from core.api_client import LoginRequiredError
+
+    bridge = _FakeBridge(_BridgeResult(200, {"status_code": 8, "status_msg": "用户未登录"}))
+    client = DouyinAPIClient({"msToken": "t"}, page_bridge=bridge)
+    with pytest.raises(LoginRequiredError):
+        await client.get_user_like("sec-1")
+    await client.close()
+
+
+async def test_bridge_not_logged_in_maps_to_login_required_error():
+    from core.api_client import LoginRequiredError
+
+    bridge = _FakeBridge(error=_BridgeFailure("NOT_LOGGED_IN"))
+    client = DouyinAPIClient({"msToken": "t"}, page_bridge=bridge)
+    with pytest.raises(LoginRequiredError):
+        await client.get_user_like("sec-1")
+    await client.close()
+
+
+async def test_bridge_other_failures_propagate_unchanged():
+    failure = _BridgeFailure("TIMEOUT")
+    bridge = _FakeBridge(error=failure)
+    client = DouyinAPIClient({"msToken": "t"}, page_bridge=bridge)
+    with pytest.raises(_BridgeFailure) as info:
+        await client.get_user_like("sec-1")
+    assert info.value is failure
+    await client.close()
+
+
+async def test_bridge_403_returns_empty_without_retry():
+    bridge = _FakeBridge(
+        _BridgeResult(403, None, "Blocked by ArgusSecurityPlugin Signature Not Found")
+    )
+    client = DouyinAPIClient({"msToken": "t"}, page_bridge=bridge)
+    page = await client.get_user_like("sec-1")
+    assert page["raw"] == {}
+    assert page["items"] == []
+    assert len(bridge.calls) == 1
+    await client.close()
+
+
+async def test_bridge_non_json_200_logs_warning_and_returns_empty(caplog, monkeypatch):
+    # APIClient uses a namespaced logger with propagate=False (see
+    # utils/logger.setup_logger); enable propagation temporarily so
+    # pytest's caplog can see the warning (same pattern as test_file_manager.py).
+    monkeypatch.setattr(logging.getLogger("APIClient"), "propagate", True)
+    bridge = _FakeBridge(_BridgeResult(200, None, "<html>challenge</html>"))
+    client = DouyinAPIClient({"msToken": "t"}, page_bridge=bridge)
+    with caplog.at_level("WARNING", logger="APIClient"):
+        page = await client.get_user_like("sec-1")
+    assert page["raw"] == {}
+    assert page["items"] == []
+    assert "Non-JSON 200 response via page bridge" in caplog.text
+    await client.close()

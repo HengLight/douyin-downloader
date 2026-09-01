@@ -1,7 +1,9 @@
 import asyncio
+import logging
 from typing import Any, Dict, List
 
 from control.queue_manager import QueueManager
+from core.downloader_base import DownloadResult
 from core.user_downloader import UserDownloader
 from storage.file_manager import FileManager
 
@@ -60,6 +62,14 @@ class _FakeAPIClient:
         self.browser_call_kwargs: List[Dict[str, Any]] = []
         self.browser_post_items: Dict[str, Dict[str, Any]] = {}
         self.browser_post_stats: Dict[str, int] = {}
+        self.homepage_screenshot_calls: List[tuple[str, Any, Dict[str, Any]]] = []
+
+    async def get_user_info(self, sec_uid: str):
+        return {"uid": "uid-1", "sec_uid": sec_uid, "nickname": "tester"}
+
+    async def save_user_homepage_screenshot(self, sec_uid: str, save_path, *, profile=None):
+        self.homepage_screenshot_calls.append((sec_uid, save_path, profile))
+        return True
 
     async def get_user_post(self, _sec_uid: str, max_cursor: int = 0, _count: int = 20):
         self.user_post_calls.append(max_cursor)
@@ -100,12 +110,19 @@ def _build_downloader(
     browser_enabled: bool,
     progress_reporter=None,
     number_post: int = 0,
+    author_url: bool = False,
+    homepage_screenshot: bool = False,
+    author_dir: str = "nickname",
+    increase_post: bool = True,
 ) -> UserDownloader:
     config_data = {
         "number": {"post": number_post},
-        "increase": {"post": False},
+        "increase": {"post": increase_post},
         "mode": ["post"],
         "thread": 2,
+        "author_url": author_url,
+        "homepage_screenshot": homepage_screenshot,
+        "author_dir": author_dir,
         "browser_fallback": {
             "enabled": browser_enabled,
             "headless": True,
@@ -128,6 +145,64 @@ def _build_downloader(
     )
     downloader.progress_reporter = progress_reporter
     return downloader
+
+
+def test_increment_disabled_redownloads_existing_item(tmp_path, monkeypatch):
+    aweme_id = "7412345678901234567"
+    api_client = _FakeAPIClient()
+    downloader = _build_downloader(
+        tmp_path,
+        api_client,
+        browser_enabled=False,
+        increase_post=False,
+    )
+    media_path = tmp_path / "Downloaded" / f"2026-08-21_demo_{aweme_id}.mp4"
+    media_path.parent.mkdir(parents=True, exist_ok=True)
+    media_path.write_bytes(b"existing-media")
+    downloaded_ids: List[str] = []
+
+    async def _record_download(item, *_args, **_kwargs):
+        downloaded_ids.append(str(item.get("aweme_id")))
+        return True
+
+    monkeypatch.setattr(downloader, "_download_aweme_assets", _record_download)
+
+    result = asyncio.run(
+        downloader._download_mode_items(
+            "post",
+            [_make_aweme(aweme_id)],
+            "tester",
+        )
+    )
+
+    assert downloaded_ids == [aweme_id]
+    assert result.success == 1
+    assert result.skipped == 0
+
+
+def test_unconfigured_mode_keeps_disk_dedupe(tmp_path, monkeypatch):
+    aweme_id = "7412345678901234568"
+    downloader = _build_downloader(tmp_path, _FakeAPIClient(), browser_enabled=False)
+    downloader.config._data["increase"] = {}
+    media_path = tmp_path / "Downloaded" / f"2026-08-21_demo_{aweme_id}.mp4"
+    media_path.parent.mkdir(parents=True, exist_ok=True)
+    media_path.write_bytes(b"existing-media")
+
+    async def _unexpected_download(*_args, **_kwargs):
+        raise AssertionError("unconfigured modes must keep disk dedupe")
+
+    monkeypatch.setattr(downloader, "_download_aweme_assets", _unexpected_download)
+
+    result = asyncio.run(
+        downloader._download_mode_items(
+            "collect",
+            [_make_aweme(aweme_id)],
+            "tester",
+        )
+    )
+
+    assert result.skipped == 1
+    assert result.success == 0
 
 
 def test_user_post_browser_fallback_recovers_missing_pages(tmp_path, monkeypatch):
@@ -296,7 +371,7 @@ def test_user_post_reports_step_and_item_progress(tmp_path, monkeypatch):
         progress_reporter=reporter,
     )
 
-    async def _fake_should_download(aweme_id):
+    async def _fake_should_download(aweme_id, **_kwargs):
         return aweme_id != "222"
 
     async def _fake_download_aweme_assets(item, *_args, **_kwargs):
@@ -322,3 +397,188 @@ def test_user_post_reports_step_and_item_progress(tmp_path, monkeypatch):
     assert statuses.count("success") == 1
     assert statuses.count("skipped") == 1
     assert statuses.count("failed") == 1
+
+
+def test_homepage_artifacts_disabled_do_not_save(tmp_path, monkeypatch):
+    api_client = _FakeAPIClient()
+    downloader = _build_downloader(tmp_path, api_client, browser_enabled=False)
+
+    async def _mode_result(*_args, **_kwargs):
+        result = DownloadResult()
+        result.total = 1
+        result.success = 1
+        return result
+
+    monkeypatch.setattr(downloader, "_download_mode_logged", _mode_result)
+
+    result = asyncio.run(downloader.download({"sec_uid": "sec_uid_x"}))
+
+    assert result.success == 1
+    assert api_client.homepage_screenshot_calls == []
+    assert not (tmp_path / "Downloaded" / "tester" / "author_url.txt").exists()
+
+
+def test_author_url_enabled_saves_without_screenshot(tmp_path, monkeypatch):
+    api_client = _FakeAPIClient()
+    downloader = _build_downloader(
+        tmp_path,
+        api_client,
+        browser_enabled=False,
+        author_url=True,
+    )
+
+    async def _mode_result(*_args, **_kwargs):
+        return DownloadResult()
+
+    monkeypatch.setattr(downloader, "_download_mode_logged", _mode_result)
+
+    asyncio.run(downloader.download({"sec_uid": "sec_uid_x"}))
+
+    assert api_client.homepage_screenshot_calls == []
+    author_url_path = tmp_path / "Downloaded" / "tester" / "author_url.txt"
+    assert author_url_path.read_text(encoding="utf-8") == (
+        "https://www.douyin.com/user/sec_uid_x\n"
+    )
+
+
+def test_homepage_screenshot_uses_configured_author_root(tmp_path, monkeypatch):
+    api_client = _FakeAPIClient()
+    downloader = _build_downloader(
+        tmp_path,
+        api_client,
+        browser_enabled=False,
+        homepage_screenshot=True,
+        author_dir="nickname_uid",
+    )
+
+    async def _mode_result(*_args, **_kwargs):
+        return DownloadResult()
+
+    monkeypatch.setattr(downloader, "_download_mode_logged", _mode_result)
+
+    asyncio.run(downloader.download({"sec_uid": "sec_uid_x"}))
+
+    assert len(api_client.homepage_screenshot_calls) == 1
+    screenshot_sec_uid, screenshot_path, screenshot_profile = api_client.homepage_screenshot_calls[
+        0
+    ]
+    assert screenshot_sec_uid == "sec_uid_x"
+    assert screenshot_profile == {"uid": "uid-1", "sec_uid": "sec_uid_x", "nickname": "tester"}
+    author_root = tmp_path / "Downloaded" / "tester_sec_uid_x"
+    assert screenshot_path == (author_root / "主页截图.png").resolve()
+    assert not (author_root / "author_url.txt").exists()
+
+
+def test_author_url_overwrites_existing_file(tmp_path):
+    downloader = _build_downloader(
+        tmp_path,
+        _FakeAPIClient(),
+        browser_enabled=False,
+        author_url=True,
+        author_dir="nickname_uid",
+    )
+    target = tmp_path / "Downloaded" / "tester_sec_uid_x" / "author_url.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("stale\n", encoding="utf-8")
+
+    asyncio.run(
+        downloader._save_author_home_url(
+            "sec_uid_x",
+            {"sec_uid": "sec_uid_x", "nickname": "tester"},
+            ["post"],
+        )
+    )
+
+    assert target.read_text(encoding="utf-8") == ("https://www.douyin.com/user/sec_uid_x\n")
+
+
+def test_author_url_skips_collect_only_context(tmp_path):
+    downloader = _build_downloader(
+        tmp_path,
+        _FakeAPIClient(),
+        browser_enabled=False,
+        author_url=True,
+    )
+
+    for mode in ("collect", "collectmix"):
+        asyncio.run(
+            downloader._save_author_home_url(
+                "sec_uid_x",
+                {"sec_uid": "sec_uid_x", "nickname": "tester"},
+                [mode],
+            )
+        )
+        assert not (tmp_path / "Downloaded" / "tester" / "author_url.txt").exists()
+
+
+def test_author_url_write_failure_does_not_raise(tmp_path, monkeypatch, caplog):
+    downloader = _build_downloader(
+        tmp_path,
+        _FakeAPIClient(),
+        browser_enabled=False,
+        author_url=True,
+    )
+
+    def _fail_open(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("core.user_downloader.aiofiles.open", _fail_open)
+    monkeypatch.setattr(logging.getLogger("UserDownloader"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="UserDownloader"):
+        asyncio.run(
+            downloader._save_author_home_url(
+                "sec_uid_x",
+                {"sec_uid": "sec_uid_x", "nickname": "tester"},
+                ["post"],
+            )
+        )
+
+    assert "Author homepage URL failed" in caplog.text
+
+
+def test_homepage_screenshot_failure_does_not_fail_download(tmp_path, monkeypatch):
+    api_client = _FakeAPIClient()
+    downloader = _build_downloader(
+        tmp_path,
+        api_client,
+        browser_enabled=False,
+        homepage_screenshot=True,
+    )
+
+    async def _screenshot_failure(*_args, **_kwargs):
+        raise RuntimeError("browser unavailable")
+
+    async def _mode_result(*_args, **_kwargs):
+        result = DownloadResult()
+        result.total = 2
+        result.success = 2
+        return result
+
+    monkeypatch.setattr(api_client, "save_user_homepage_screenshot", _screenshot_failure)
+    monkeypatch.setattr(downloader, "_download_mode_logged", _mode_result)
+
+    result = asyncio.run(downloader.download({"sec_uid": "sec_uid_x"}))
+
+    assert result.total == 2
+    assert result.success == 2
+    assert result.failed == 0
+
+
+def test_homepage_screenshot_skips_collect_context(tmp_path):
+    api_client = _FakeAPIClient()
+    downloader = _build_downloader(
+        tmp_path,
+        api_client,
+        browser_enabled=False,
+        homepage_screenshot=True,
+    )
+
+    asyncio.run(
+        downloader._save_homepage_screenshot(
+            "sec_uid_x",
+            {"sec_uid": "sec_uid_x", "nickname": "tester"},
+            ["collect"],
+        )
+    )
+
+    assert api_client.homepage_screenshot_calls == []

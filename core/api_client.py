@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import random
 import re
+import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -25,6 +28,98 @@ except Exception:  # pragma: no cover - optional dependency
 logger = setup_logger("APIClient")
 
 _LOGIN_REQUIRED_STATUS_CODES = {2483}
+
+# Douyin fronts the web API with an edge WAF that answers 403 (and 429)
+# once a caller trips a rate-based risk-control rule. Both are transient:
+# the block is served in tens of milliseconds without reaching the
+# backend, and the *same* cookies succeed again after a cooldown. A real
+# logout never looks like this — Douyin reports those as HTTP 200 with a
+# non-zero ``status_code`` (see ``_is_login_required``), so retrying a
+# 403 cannot mask an expired session.
+#
+# These reuse the ordinary retry schedule on purpose. A longer WAF-specific
+# backoff was tried and reverted: ``_request_json`` is the chokepoint for
+# every Douyin call, so stretching it to ~20s per request blew past the
+# renderer's 15s timeout on the my-content routes and turned per-item loops
+# (``user_downloader``'s detail recovery) into multi-hour stalls. Callers
+# that walk many pages degrade gracefully on an exhausted fetch instead.
+_RISK_CONTROL_HTTP_STATUSES = frozenset({403, 429})
+
+_HOMEPAGE_SCREENSHOT_BRIDGE_ENV = "DOUYIN_HOMEPAGE_SCREENSHOT_BRIDGE"
+_HOMEPAGE_SCREENSHOT_MESSAGE_PREFIX = "DOUYIN_HOMEPAGE_SCREENSHOT_REQUEST "
+_HOMEPAGE_PROFILE_READY_SCRIPT = r"""(expected) => {
+    const normalize = (value) => String(value ?? "")
+        .normalize("NFKC").replace(/\s+/g, "").toLowerCase();
+    const readyKey = "__DOUYIN_HOMEPAGE_PROFILE_READY_STATE__";
+    const blockedKey = "__DOUYIN_HOMEPAGE_PROFILE_BLOCKED_REASON__";
+    const reset = () => {
+        delete window[readyKey];
+        return false;
+    };
+    if (document.readyState !== "complete" || !document.body) return reset();
+
+    const bodyText = normalize(document.body.innerText || document.body.textContent);
+    const blocked = ["验证码", "安全验证", "验证后继续", "页面不存在", "用户不存在",
+        "账号已注销"].find((marker) => bodyText.includes(normalize(marker)));
+    if (blocked) {
+        window[blockedKey] = blocked;
+        return reset();
+    }
+    delete window[blockedKey];
+
+    const visible = (element) => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" &&
+            style.opacity !== "0" && rect.width > 0 && rect.height > 0 &&
+            rect.bottom > 0 && rect.top < Math.max(window.innerHeight || 0, 900);
+    };
+    const numberToken = "(\\d+(?:[.,]\\d+)?(?:万|亿|w|k|m)?\\+?)";
+    const groups = [["关注"], ["粉丝"], ["获赞", "点赞"]];
+    const readStats = (text, direction) => groups.map((labels) => {
+        for (const label of labels) {
+            const normalizedLabel = normalize(label);
+            const pattern = direction === "before"
+                ? new RegExp(`${numberToken}${normalizedLabel}`)
+                : new RegExp(`${normalizedLabel}${numberToken}`);
+            const match = text.match(pattern);
+            if (match?.[1]) return match[1];
+        }
+        return "";
+    });
+    const expectedNickname = normalize(expected?.nickname);
+    const candidates = Array.from(
+        document.body.querySelectorAll("main, header, section, article, div")
+    ).filter(visible).map((element) => {
+        const text = normalize(element.innerText || element.textContent);
+        if (!text || text.length > 1500) return null;
+        const before = readStats(text, "before");
+        const after = readStats(text, "after");
+        const beforeCount = before.filter(Boolean).length;
+        const afterCount = after.filter(Boolean).length;
+        const values = afterCount >= beforeCount ? after : before;
+        if (!values[1] || Math.max(beforeCount, afterCount) < 2) return null;
+        if (expectedNickname && !text.includes(expectedNickname)) return null;
+        return {element, text, values};
+    }).filter(Boolean).sort((left, right) => left.text.length - right.text.length);
+    const profile = candidates[0];
+    if (!profile) return reset();
+    const images = Array.from(document.images).filter(visible);
+    if (images.some((image) => !image.complete)) return reset();
+    if (document.fonts && document.fonts.status !== "loaded") return reset();
+
+    const loaded = images.filter((image) => image.naturalWidth > 0).length;
+    const signature = profile.values.concat(String(loaded)).join("|");
+    const previous = window[readyKey];
+    const count = previous?.signature === signature ? previous.count + 1 : 1;
+    window[readyKey] = {signature, count};
+    return count >= 3;
+}"""
+_HOMEPAGE_PROFILE_BLOCKED_SCRIPT = (
+    "() => String(window.__DOUYIN_HOMEPAGE_PROFILE_BLOCKED_REASON__ || '')"
+)
+# 就绪判定要等到懒加载的作品网格铺完，冷缓存下 20 秒常常不够。
+_HOMEPAGE_PROFILE_READY_TIMEOUT_MS = 45_000
 
 
 class LoginRequiredError(Exception):
@@ -50,11 +145,7 @@ def _is_login_required(data: object) -> bool:
     # Douyin error code, but "用户未登录" is unambiguously "not logged in"
     # (returned by /profile/self/ and other endpoints on an expired
     # session). Message-matching avoids misreading an unrelated code-8.
-    return (
-        code in _LOGIN_REQUIRED_STATUS_CODES
-        or "请先登录" in msg
-        or "用户未登录" in msg
-    )
+    return code in _LOGIN_REQUIRED_STATUS_CODES or "请先登录" in msg or "用户未登录" in msg
 
 
 def _summarize_api_response(data: object) -> Dict[str, Any]:
@@ -160,9 +251,19 @@ class DouyinAPIClient:
         "login_time",
     }
 
-    def __init__(self, cookies: Dict[str, str], proxy: Optional[str] = None):
+    def __init__(
+        self,
+        cookies: Dict[str, str],
+        proxy: Optional[str] = None,
+        page_bridge: Optional[Any] = None,
+    ):
         self.cookies = sanitize_cookies(cookies or {})
         self.proxy = str(proxy or "").strip()
+        # 桌面版注入的页面签名通道(core/page_bridge.py,desktop-only)。为 None 时
+        # 所有端点走 aiohttp——CLI 姊妹仓永远是 None。鸭子类型:只要求
+        # ``await fetch(path, params, method=, data=)`` 返回带 http_status/body/text
+        # 的对象,失败异常带 ``page_bridge_code``。
+        self.page_bridge = page_bridge
         self._session: Optional[aiohttp.ClientSession] = None
         self._browser_post_aweme_items: Dict[str, Dict[str, Any]] = {}
         self._browser_post_stats: Dict[str, int] = {}
@@ -265,22 +366,30 @@ class DouyinAPIClient:
         params: Dict[str, Any],
         *,
         base_url: Optional[str] = None,
+        request_data: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str]:
         query = urlencode(params)
         endpoint = f"{(base_url or self.BASE_URL).rstrip('/')}{path}"
-        ab_signed = self._build_abogus_url(endpoint, query)
+        ab_signed = self._build_abogus_url(endpoint, query, request_data=request_data)
         if ab_signed:
             return ab_signed
         return self.sign_url(f"{endpoint}?{query}")
 
-    def _build_abogus_url(self, base_url: str, query: str) -> Optional[Tuple[str, str]]:
+    def _build_abogus_url(
+        self,
+        base_url: str,
+        query: str,
+        *,
+        request_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Tuple[str, str]]:
         if not self._abogus_enabled:
             return None
 
         try:
             browser_fp = BrowserFingerprintGenerator.generate_fingerprint("Chrome")
             signer = ABogus(fp=browser_fp, user_agent=self.headers["User-Agent"])
-            params_with_ab, _ab, ua, _body = signer.generate_abogus(query, "")
+            body = urlencode(request_data or {})
+            params_with_ab, _ab, ua, _body = signer.generate_abogus(query, body)
             return f"{base_url}?{params_with_ab}", ua
         except Exception as exc:
             logger.warning("Failed to generate a_bogus, fallback to X-Bogus: %s", exc)
@@ -295,22 +404,32 @@ class DouyinAPIClient:
         max_retries: int = 3,
         base_url: Optional[str] = None,
         request_headers: Optional[Dict[str, str]] = None,
+        method: str = "GET",
+        data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         await self._ensure_session()
+        method = method.upper()
+        if method not in {"GET", "POST"}:
+            raise ValueError(f"unsupported request method: {method}")
         delays = [1, 2, 5]
         last_exc: Optional[Exception] = None
+        risk_control_hit = False
 
         for attempt in range(max_retries):
             started = time.monotonic()
+            risk_control_hit = False
+            signing_kwargs: Dict[str, Any] = {}
             if base_url:
-                signed_url, ua = self.build_signed_path(path, params, base_url=base_url)
-            else:
-                signed_url, ua = self.build_signed_path(path, params)
+                signing_kwargs["base_url"] = base_url
+            if method == "POST":
+                signing_kwargs["request_data"] = data
+            signed_url, ua = self.build_signed_path(path, params, **signing_kwargs)
             signer = "a_bogus" if "a_bogus=" in signed_url else "x_bogus"
             logger.info(
-                "Douyin API request: path=%s attempt=%d/%d signer=%s proxy_enabled=%s "
-                "base=%s param_keys=%s",
+                "Douyin API request: path=%s method=%s attempt=%d/%d signer=%s "
+                "proxy_enabled=%s base=%s param_keys=%s",
                 path,
+                method,
                 attempt + 1,
                 max_retries,
                 signer,
@@ -318,12 +437,16 @@ class DouyinAPIClient:
                 "custom" if base_url else "default",
                 ",".join(sorted(str(key) for key in params)),
             )
+            headers = {**self.headers, **(request_headers or {}), "User-Agent": ua}
+            request = self._session.post if method == "POST" else self._session.get
+            request_kwargs: Dict[str, Any] = {
+                "headers": headers,
+                "proxy": self.proxy or None,
+            }
+            if method == "POST":
+                request_kwargs["data"] = data or {}
             try:
-                async with self._session.get(
-                    signed_url,
-                    headers={**self.headers, **(request_headers or {}), "User-Agent": ua},
-                    proxy=self.proxy or None,
-                ) as response:
+                async with request(signed_url, **request_kwargs) as response:
                     if response.status == 200:
                         body = await response.read()
                         if not body:
@@ -370,7 +493,8 @@ class DouyinAPIClient:
                                 path,
                             )
                         return result
-                    if response.status < 500 and response.status != 429:
+                    risk_control_hit = response.status in _RISK_CONTROL_HTTP_STATUSES
+                    if response.status < 500 and not risk_control_hit:
                         log_fn = logger.info if suppress_error else logger.error
                         log_fn(
                             "Douyin API HTTP failure: path=%s attempt=%d/%d status=%s "
@@ -386,12 +510,13 @@ class DouyinAPIClient:
                     last_exc = RuntimeError(f"HTTP {response.status} for {path}")
                     logger.warning(
                         "Douyin API retryable HTTP failure: path=%s attempt=%d/%d status=%s "
-                        "duration_ms=%d",
+                        "duration_ms=%d risk_control=%s",
                         path,
                         attempt + 1,
                         max_retries,
                         response.status,
                         _elapsed_ms(started),
+                        risk_control_hit,
                     )
             except LoginRequiredError:
                 raise
@@ -411,11 +536,13 @@ class DouyinAPIClient:
             if attempt < max_retries - 1:
                 delay = delays[min(attempt, len(delays) - 1)]
                 logger.info(
-                    "Douyin API retry scheduled: path=%s completed_attempt=%d/%d delay_s=%d",
+                    "Douyin API retry scheduled: path=%s completed_attempt=%d/%d "
+                    "delay_s=%d risk_control=%s",
                     path,
                     attempt + 1,
                     max_retries,
                     delay,
+                    risk_control_hit,
                 )
                 await asyncio.sleep(delay)
 
@@ -428,6 +555,75 @@ class DouyinAPIClient:
             suppress_error,
             type(last_exc).__name__ if last_exc else "-",
             _safe_error_text(last_exc) if last_exc else "-",
+        )
+        return {}
+
+    def _payload_from_bridge_result(self, result: Any, path: str, started: float) -> Dict[str, Any]:
+        """把 bridge 200 响应折算成与 ``_request_json`` 一致的 payload。
+
+        body 非 dict(如反爬 HTML challenge 页)按 Non-JSON 200 记警告并降级为
+        ``{}``,与 aiohttp 路径的同名日志对齐,避免把它悄悄记成成功响应。
+        """
+        text = str(getattr(result, "text", "") or "")
+        body = getattr(result, "body", None)
+        if not isinstance(body, dict):
+            logger.warning(
+                "Non-JSON 200 response via page bridge: path=%s text_len=%d",
+                path,
+                len(text),
+            )
+        payload = body if isinstance(body, dict) else {}
+        _log_api_response(path, 0, 1, text.encode("utf-8", "replace"), payload, started)
+        if _is_login_required(payload):
+            raise LoginRequiredError(
+                int(payload.get("status_code") or 0),
+                str(payload.get("status_msg") or ""),
+                path,
+            )
+        return payload
+
+    async def _request_json_gated(
+        self,
+        path: str,
+        params: Dict[str, Any],
+        *,
+        method: str = "GET",
+        data: Optional[Dict[str, Any]] = None,
+        request_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """被 ArgusSecurityPlugin 门禁的端点入口。
+
+        有 ``page_bridge`` 时交给 Electron 隐藏登录窗口发(页面 SDK 补
+        uifid / timestamp / x-secsdk-web-signature),否则与 ``_request_json``
+        完全一致。经 bridge 的 403/429 不重试:Argus 拒绝是确定性的,重试只会
+        加速触发验证码。
+        """
+        if self.page_bridge is None:
+            return await self._request_json(
+                path, params, method=method, data=data, request_headers=request_headers
+            )
+        started = time.monotonic()
+        logger.info(
+            "Douyin API request via page bridge: path=%s method=%s param_keys=%s",
+            path,
+            method.upper(),
+            ",".join(sorted(str(key) for key in params)),
+        )
+        try:
+            result = await self.page_bridge.fetch(path, params, method=method.upper(), data=data)
+        except Exception as exc:
+            if getattr(exc, "page_bridge_code", None) == "NOT_LOGGED_IN":
+                raise LoginRequiredError(0, "page bridge: not logged in", path) from exc
+            raise
+        status = int(getattr(result, "http_status", 0) or 0)
+        if status == 200:
+            return self._payload_from_bridge_result(result, path, started)
+        logger.error(
+            "Douyin API HTTP failure via page bridge: path=%s status=%s duration_ms=%d body=%r",
+            path,
+            status,
+            _elapsed_ms(started),
+            str(getattr(result, "text", "") or "")[:80],
         )
         return {}
 
@@ -573,7 +769,7 @@ class DouyinAPIClient:
         self, sec_uid: str, max_cursor: int = 0, count: int = 20
     ) -> Dict[str, Any]:
         params = await self._build_user_page_params(sec_uid, max_cursor, count)
-        raw = await self._request_json("/aweme/v1/web/aweme/favorite/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/aweme/favorite/", params)
         return self._normalize_paged_response(raw, item_keys=["aweme_list"])
 
     async def get_user_mix(
@@ -645,6 +841,40 @@ class DouyinAPIClient:
         )
         return params
 
+    async def get_user_collection(
+        self, sec_uid: str = "self", max_cursor: int = 0, count: int = 20
+    ) -> Dict[str, Any]:
+        """Fetch one page of the logged-in account's collected awemes.
+
+        This is the account-level/default collection feed. It is distinct
+        from ``get_user_collects`` (custom folder metadata) and from
+        ``get_user_like`` (liked awemes). Douyin currently exposes it as a
+        form-encoded POST whose cursor lives in the request body.
+        """
+        if sec_uid and sec_uid != "self":
+            logger.warning("Account collection currently requires self sec_uid, got=%s", sec_uid)
+            return self._normalize_paged_response({}, item_keys=["aweme_list"], source="api")
+
+        params = await self._default_query()
+        params.update(
+            {
+                "publish_video_strategy_type": "2",
+                "version_code": "170400",
+                "version_name": "17.4.0",
+            }
+        )
+        raw = await self._request_json_gated(
+            "/aweme/v1/web/aweme/listcollection/",
+            params,
+            method="POST",
+            data={"count": count, "cursor": max_cursor},
+            request_headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://www.douyin.com/user/self?showTab=favorite_collection",
+            },
+        )
+        return self._normalize_paged_response(raw, item_keys=["aweme_list"])
+
     async def get_user_collects(
         self, sec_uid: str, max_cursor: int = 0, count: int = 10
     ) -> Dict[str, Any]:
@@ -653,7 +883,7 @@ class DouyinAPIClient:
             return self._normalize_paged_response({}, item_keys=["collects_list"], source="api")
 
         params = await self._build_collect_page_params(max_cursor, count)
-        raw = await self._request_json("/aweme/v1/web/collects/list/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/collects/list/", params)
         return self._normalize_paged_response(raw, item_keys=["collects_list"])
 
     async def get_collect_aweme(
@@ -661,7 +891,7 @@ class DouyinAPIClient:
     ) -> Dict[str, Any]:
         params = await self._build_collect_page_params(max_cursor, count)
         params.update({"collects_id": collects_id})
-        raw = await self._request_json("/aweme/v1/web/collects/video/list/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/collects/video/list/", params)
         return self._normalize_paged_response(raw, item_keys=["aweme_list"])
 
     async def get_user_collect_mix(
@@ -672,7 +902,7 @@ class DouyinAPIClient:
             return self._normalize_paged_response({}, item_keys=["mix_infos"], source="api")
 
         params = await self._build_collect_page_params(max_cursor, count)
-        raw = await self._request_json("/aweme/v1/web/mix/listcollection/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/mix/listcollection/", params)
         return self._normalize_paged_response(raw, item_keys=["mix_infos"])
 
     async def get_user_info(self, sec_uid: str) -> Optional[Dict[str, Any]]:
@@ -1152,6 +1382,152 @@ class DouyinAPIClient:
         except Exception as e:
             logger.error("Failed to resolve short URL: %s, error: %s", safe_log_url(short_url), e)
             return None
+
+    async def save_user_homepage_screenshot(
+        self,
+        sec_uid: str,
+        save_path: Path,
+        *,
+        profile: Optional[Dict[str, Any]] = None,
+        viewport_width: int = 1600,
+        viewport_height: int = 900,
+        timeout_seconds: int = 30,
+    ) -> bool:
+        """Save one creator-homepage viewport without affecting downloads."""
+        if os.environ.get(_HOMEPAGE_SCREENSHOT_BRIDGE_ENV) == "electron":
+            return self._emit_homepage_screenshot_request(sec_uid, save_path, profile)
+
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning("Playwright not available, homepage screenshot skipped: %s", exc)
+            return False
+
+        target = Path(save_path)
+        tmp_path = target.with_name(f".{target.name}.tmp")
+        target_url = f"{self.BASE_URL}/user/{sec_uid}"
+        timeout_ms = max(5, int(timeout_seconds)) * 1000
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            async with async_playwright() as playwright:
+                launch_options: Dict[str, Any] = {
+                    "headless": True,
+                    "args": [
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-dev-shm-usage",
+                        "--no-sandbox",
+                    ],
+                }
+                proxy = str(self.proxy or "").strip()
+                if proxy:
+                    if proxy.startswith("socks5h://"):
+                        proxy = "socks5://" + proxy[len("socks5h://") :]
+                    launch_options["proxy"] = {"server": proxy}
+
+                browser = await playwright.chromium.launch(**launch_options)
+                try:
+                    context = await browser.new_context(
+                        user_agent=self.headers.get("User-Agent", ""),
+                        locale="zh-CN",
+                        viewport={"width": viewport_width, "height": viewport_height},
+                    )
+                    try:
+                        cookies = self._browser_cookie_payload()
+                        if cookies:
+                            await context.add_cookies(cookies)
+                        page = await context.new_page()
+                        await page.goto(
+                            target_url,
+                            wait_until="domcontentloaded",
+                            timeout=timeout_ms,
+                        )
+                        title = await page.title()
+                        if "验证码" in title:
+                            logger.warning(
+                                "Homepage screenshot skipped because verification is required"
+                            )
+                            return False
+                        profile_expectation: Dict[str, str] = {}
+                        if isinstance(profile, dict):
+                            nickname = profile.get("nickname")
+                            if isinstance(nickname, str) and nickname.strip():
+                                profile_expectation["nickname"] = nickname.strip()[:200]
+                        try:
+                            await page.wait_for_function(
+                                _HOMEPAGE_PROFILE_READY_SCRIPT,
+                                arg=profile_expectation,
+                                polling=250,
+                                timeout=_HOMEPAGE_PROFILE_READY_TIMEOUT_MS,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Homepage profile data did not become ready before capture: %s",
+                                _safe_error_text(exc),
+                            )
+                        try:
+                            blocked_reason = await page.evaluate(_HOMEPAGE_PROFILE_BLOCKED_SCRIPT)
+                        except Exception:
+                            blocked_reason = ""
+                        if blocked_reason:
+                            logger.warning(
+                                "Homepage screenshot skipped because the page is blocked: %s",
+                                blocked_reason,
+                            )
+                            return False
+                        await page.screenshot(path=str(tmp_path), type="png", full_page=False)
+                        await asyncio.to_thread(os.replace, tmp_path, target)
+                    finally:
+                        await context.close()
+                finally:
+                    await browser.close()
+        except Exception as exc:
+            logger.warning(
+                "Failed to save homepage screenshot for %s: %s",
+                sec_uid,
+                _safe_error_text(exc),
+            )
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+
+        logger.info("Homepage screenshot saved: %s", target)
+        return True
+
+    @staticmethod
+    def _emit_homepage_screenshot_request(
+        sec_uid: str,
+        save_path: Path,
+        profile: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        try:
+            safe_profile: Dict[str, Any] = {}
+            if isinstance(profile, dict):
+                nickname = profile.get("nickname")
+                if isinstance(nickname, str) and nickname.strip():
+                    safe_profile["nickname"] = nickname.strip()[:200]
+                for key in ("follower_count", "following_count", "total_favorited"):
+                    count = profile.get(key)
+                    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                        safe_profile[key] = count
+
+            request = {"version": 1, "sec_uid": str(sec_uid), "save_path": str(save_path)}
+            if safe_profile:
+                request["profile"] = safe_profile
+            payload = json.dumps(
+                request,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+            sys.stdout.write(f"{_HOMEPAGE_SCREENSHOT_MESSAGE_PREFIX}{encoded}\n")
+            sys.stdout.flush()
+            return True
+        except Exception as exc:
+            logger.warning("Failed to request Electron homepage screenshot: %s", exc)
+            return False
 
     async def collect_user_post_ids_via_browser(
         self,
